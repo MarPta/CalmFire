@@ -10,6 +10,7 @@
 
 #include <HT1621_universal.h>
 #include "Control/OnOffRegulator.h"
+#include "encoder.h"
 
 const uint8_t dhtPin = 17;
 const uint8_t displayCsPin = 14;   //Chip selection output
@@ -18,6 +19,7 @@ const uint8_t displayDataPin = 26; //Serial data output
 const uint8_t DISPLAY_LED = 13;
 const uint16_t displayNightLightThreshold = 300; //0-4096 
 const uint16_t displayNightLightMax = 80; //0-1023
+const uint16_t displayModDelay = 3000;  //[ms]
 const uint8_t defaultLowTemp = 10;  //[°C]
 const uint8_t defaultHighTemp = 20;  //[°C]
 
@@ -28,7 +30,7 @@ const uint8_t resolution = 10;
 
 const uint8_t photoresistorPin = 35;
 const uint8_t relayPin = 16;
-const float desiredTempMax = 25.0;   //[°C]
+const float desiredTempMax = 30.0;   //[°C]
 const float desiredTempMin = 5.0;   //[°C]
 const float hysteresisUpTemp = 0.3;      //[°C]
 const float hysteresisDownTemp = 0.3;    //[°C]
@@ -71,6 +73,7 @@ struct stateVector{
     bool relayOn = false;
     int16_t illuminance = 0;   //12-bit reading
     int16_t displayBrightness = 0;   //10-bit output
+    uint8_t displayState = 0;   //measuredTemp, desiredTemp
 } currentStateVector;
 
 DHT dht(dhtPin, DHT22);
@@ -78,6 +81,7 @@ WiFiManager wifiManager;
 Preferences flashPreferences;
 OnOffRegulator heatRegulator;
 HT1621_universal lcd(displayCsPin, displayWrPin, displayDataPin);
+Encoder encoder1(1);   //slot 1
 
 template <typename T>
 T clamp(T value, T min, T max) {
@@ -143,8 +147,6 @@ void loop(){
     Serial.print("  HeatHigh: ");
     Serial.println(currentStateVector.heatHigh);
 
-    lcd.displayCelsius(currentStateVector.actualTemp);
-
     //Automatic control
     if(currentStateVector.heatHigh)
         currentStateVector.relayOn = heatRegulator.getRegAction(currentStateVector.desiredTempHigh, currentStateVector.actualTemp);
@@ -154,13 +156,42 @@ void loop(){
     currentStateVector.displayBrightness = displayNightLightThreshold - currentStateVector.illuminance;
     currentStateVector.displayBrightness = clamp<int>(currentStateVector.displayBrightness, 0, displayNightLightMax);
 
-    char message[20];
+    static uint32_t lastMovedEnc = 0;
+    switch(currentStateVector.displayState) {
+        case 0:
+            lcd.displayCelsius(currentStateVector.actualTemp);
+            if(encoder1.getDiff() != 0) {
+                currentStateVector.displayState = 1;
+                lastMovedEnc = millis();
+            }
+            break;
+        case 1:
+            int16_t diff = encoder1.getDiff();
+            if(diff != 0)
+                lastMovedEnc = millis();
+            if(currentStateVector.heatHigh == 0) {
+                currentStateVector.desiredTempLow += diff * 0.05;
+                currentStateVector.desiredTempLow = clamp<float>(currentStateVector.desiredTempLow, desiredTempMin, desiredTempMax);
+                lcd.displayCelsius(currentStateVector.desiredTempLow);
+            }
+            else {
+                currentStateVector.desiredTempHigh += diff * 0.05;
+                currentStateVector.desiredTempHigh = clamp<float>(currentStateVector.desiredTempHigh, desiredTempMin, desiredTempMax);
+                lcd.displayCelsius(currentStateVector.desiredTempHigh);
+            }
+            if(millis() > lastMovedEnc + displayModDelay) {
+                currentStateVector.displayState = 0;
+            }
+            break;
+    };
+
+    /*char message[20];
     snprintf (message, 20, "%.1f", currentStateVector.actualTemp);
-    mqttClient.publish(tempTopic, message);
+    mqttClient.publish(tempTopic, message);*/
 
     //Updating actuators accoring to current StateVector variables
     digitalWrite(relayPin, currentStateVector.relayOn);
     ledcWrite(ledChannel, currentStateVector.displayBrightness);
 
-    delay(500);
+    delay(20);
 }
