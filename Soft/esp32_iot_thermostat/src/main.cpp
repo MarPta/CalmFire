@@ -6,6 +6,7 @@
 #include <WiFiManager.h>
 #include "Adafruit_Sensor.h"
 #include "DHT.h"
+#include <PubSubClient.h>
 
 #include <HT1621_universal.h>
 #include "Control/OnOffRegulator.h"
@@ -31,6 +32,35 @@ const float desiredTempMax = 25.0;   //[°C]
 const float desiredTempMin = 5.0;   //[°C]
 const float hysteresisUpTemp = 0.3;      //[°C]
 const float hysteresisDownTemp = 0.3;    //[°C]
+
+#define MQTT_SERVER "http://hassio.local:8123" //"192.168.0.6"
+#define MQTT_PORT 1883
+#define MQTT_USER "mqttUser"
+#define MQTT_PASS "mqttPass"
+#define MQTT_CLIENT_ID "CalmFire_thermostat"
+
+WiFiClient wifiClient;
+PubSubClient mqttClient(wifiClient);
+
+char * tempTopic = "thermostat/temperature";
+void mqttReceiving(char * topic, byte * payload, unsigned int length);
+void mqttReconnect();
+
+void mqttReconnect() {
+    while (!mqttClient.connected()) {
+        
+        Serial.print("Trying to connect to MQTT server ...");
+        if (mqttClient.connect(MQTT_CLIENT_ID))
+            Serial.println("connected");
+        else {
+            Serial.print("failed, status code =");
+            Serial.print(mqttClient.state());
+            Serial.println("trying again in 5 seconds");
+            delay(5000);
+        }
+    }
+    Serial.println("Connected to MQTT Succesfully!");
+}
 
 struct stateVector{
     float actualTemp = 0.0;         //[°C]
@@ -68,7 +98,7 @@ void setup(){
     ledcSetup(ledChannel, freq, resolution);
     ledcAttachPin(DISPLAY_LED, ledChannel);
 
-    wifiManager.autoConnect("IoT Thermostat", "12345678");
+    wifiManager.autoConnect("CalmFire_thermostat", "12345678");
     dht.begin();
 
     flashPreferences.begin("desiredTemps", false);  // RW-mode (second parameter false).
@@ -77,10 +107,18 @@ void setup(){
     currentStateVector.heatHigh = flashPreferences.getBool("heatHigh", false);
     flashPreferences.end();
 
+    mqttClient.setServer(MQTT_SERVER, MQTT_PORT);
+    //mqttClient.setCallback(mqttReceiving);  // When received subscribed topics
+
     heatRegulator.setParameters(hysteresisUpTemp, hysteresisDownTemp, desiredTempMax, desiredTempMin);
 }
 
 void loop(){
+    /*if (! mqttClient.connected()) {
+        mqttReconnect();
+    }
+    mqttClient.loop();    // Listening for subscribed topics*/
+
     //Updating sensor data
     float t = dht.readTemperature();
     float h = dht.readHumidity();
@@ -115,6 +153,10 @@ void loop(){
 
     currentStateVector.displayBrightness = displayNightLightThreshold - currentStateVector.illuminance;
     currentStateVector.displayBrightness = clamp<int>(currentStateVector.displayBrightness, 0, displayNightLightMax);
+
+    char message[20];
+    snprintf (message, 20, "%.1f", currentStateVector.actualTemp);
+    mqttClient.publish(tempTopic, message);
 
     //Updating actuators accoring to current StateVector variables
     digitalWrite(relayPin, currentStateVector.relayOn);
