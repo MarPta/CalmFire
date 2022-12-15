@@ -3,6 +3,12 @@
 #include "Adafruit_Sensor.h"
 #include "DHT.h"
 
+#define BLYNK_PRINT Serial
+#include "psd.h"
+#include <WiFi.h>
+#include <WiFiClient.h>
+#include "BlynkSimpleEsp32.h"
+
 #include <HT1621_universal.h>
 #include "OnOffRegulator.h"
 #include "encoder.h"
@@ -53,6 +59,13 @@ Preferences preferencesCF;
 OnOffRegulator heatRegulator;
 HT1621_universal lcd(displayCsPin, displayWrPin, displayDataPin);
 
+BLYNK_CONNECTED() {
+    Blynk.syncVirtual(V1);
+}
+BLYNK_WRITE(V1) {
+    sv.desiredTempLow = param.asFloat();
+}
+
 void setup() {
     Serial.begin(115200);
 
@@ -75,6 +88,8 @@ void setup() {
     preferencesCF.end();
 
     heatRegulator.setParameters(hysteresisUpTemp, hysteresisDownTemp, desiredTempMax, desiredTempMin);
+
+    Blynk.begin(BLYNK_AUTH_TOKEN, WIFI_SSID, WIFI_PASS);
 }
 
 void loop() {
@@ -112,6 +127,9 @@ void loop() {
     sv.displayBrightness = brightness;
 
     // Handle UI
+    Blynk.run();
+    Blynk.virtualWrite(V0, sv.measuredTemp);
+
     bool buttonUpPressed = false;
     bool buttonDownPressed = false;
     bool buttonOkPressed = false;
@@ -163,5 +181,5 @@ void loop() {
     digitalWrite(relayPin, !sv.relayOn);
     ledcWrite(ledChannel, sv.displayBrightness);
 
-    delay(100);
+    delay(10);
 }
