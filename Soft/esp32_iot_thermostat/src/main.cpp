@@ -2,7 +2,10 @@
 #include <Preferences.h>
 #include "Adafruit_Sensor.h"
 #include "DHT.h"
-#include "AdafruitIO_WiFi.h"
+#include "WiFi.h"
+#include "WiFiClientSecure.h"
+#include "Adafruit_MQTT.h"
+#include "Adafruit_MQTT_Client.h"
 
 #include <HT1621_universal.h>
 #include "OnOffRegulator.h"
@@ -24,7 +27,7 @@ const uint16_t displayReturnDelay = 3000;        // [ms]
 const float defaultLowTemp = 10.0;               // [°C]
 const float defaultHighTemp = 20.0;              // [°C]
 const float desiredTempStep = 0.5;               // [°C]
-const uint8_t defaultHeatMode = 0;
+const uint8_t defaultHeatMode = 0;               // Night
 
 // LED PWM properties
 const uint16_t freq = 5000;
@@ -37,7 +40,7 @@ const float desiredTempMax = 25.0;       // [°C]
 const float desiredTempMin = 3.0;        // [°C]
 const float hysteresisUpTemp = 0.5;      // [°C]
 const float hysteresisDownTemp = 0.5;    // [°C]
-const uint32_t measuredTempUpdatePeriod = 10000;    // 1 min [ms]
+const uint32_t measuredTempUpdatePeriod = 10000;    // 10 s [ms]
 const uint32_t updateCloudPeriod = 300000;          // 5 min [ms]
 
 
@@ -59,20 +62,54 @@ Preferences preferencesCF;
 OnOffRegulator heatRegulator;
 HT1621_universal lcd(displayCsPin, displayWrPin, displayDataPin);
 
-AdafruitIO_WiFi io(IO_USERNAME, IO_KEY, WIFI_SSID, WIFI_PASS);
+WiFiClientSecure client;
+Adafruit_MQTT_Client mqtt(&client, AIO_SERVER, AIO_SERVERPORT, AIO_USERNAME, AIO_KEY);
+
+/*
 AdafruitIO_Feed *heatMode = io.feed("heatMode");
 AdafruitIO_Feed *measuredTemp = io.feed("measuredTemp");
 AdafruitIO_Feed *desiredTemp = io.feed("desiredTemp");
 AdafruitIO_Feed *heatOn = io.feed("heatOn");
+*/
+
+Adafruit_MQTT_Publish measuredTemp = Adafruit_MQTT_Publish(&mqtt, AIO_USERNAME "/feeds/measuredTemp");
+
 
 void loadPreferences();
 void savePreferences();
-void handleHeatMode(AdafruitIO_Data *data);
-void handleDesiredTemp(AdafruitIO_Data *data);
+//void handleHeatMode(AdafruitIO_Data *data);
+//void handleDesiredTemp(AdafruitIO_Data *data);
 void sendMeasuredTemp();
 void sendDesiredTemp();
 void sendHeatMode();
 void sendHeatOn();
+
+
+void MQTT_connect() {
+    int8_t ret;
+
+    // Stop if already connected.
+    if (mqtt.connected()) {
+        return;
+    }
+
+    Serial.print("Connecting to MQTT... ");
+
+    uint8_t retries = 3;
+    while ((ret = mqtt.connect()) != 0) { // connect will return 0 for connected
+        Serial.println(mqtt.connectErrorString(ret));
+        Serial.println("Retrying MQTT connection in 5 seconds...");
+        mqtt.disconnect();
+        delay(5000);  // wait 5 seconds
+        retries--;
+        if (retries == 0) {
+            // basically die and wait for WDT to reset me
+            while (1);
+        }
+    }
+
+    Serial.println("MQTT Connected!");
+}
 
 void setup() {
     digitalWrite(relayPin, false);
@@ -92,18 +129,19 @@ void setup() {
 
     heatRegulator.setParameters(hysteresisUpTemp, hysteresisDownTemp, desiredTempMax, desiredTempMin);
 
-    io.connect();
-    heatMode->onMessage(handleHeatMode);
-    desiredTemp->onMessage(handleDesiredTemp);
-    while(io.status() < AIO_CONNECTED) {
-        Serial.print(".");
+    WiFi.begin(WLAN_SSID, WLAN_PASS);
+    while (WiFi.status() != WL_CONNECTED) {
         delay(500);
+        Serial.print(".");
     }
+    client.setCACert(adafruitio_root_ca);
+
+    //heatMode->onMessage(handleHeatMode);
+    //desiredTemp->onMessage(handleDesiredTemp);
 
     loadPreferences();
     sendDesiredTemp();
     sendHeatMode();
-
 }
 
 void loop() {
@@ -124,7 +162,7 @@ void loop() {
     sv.measuredIlluminance = analogRead(photoresistorPin);
 
     // Handle UI
-    io.run();
+    MQTT_connect();
     sendMeasuredTemp();
     sendHeatOn();
 
@@ -230,7 +268,7 @@ void savePreferences() {
     preferencesCF.putBool("heatMode", sv.heatMode);
     preferencesCF.end();
 }
-void handleHeatMode(AdafruitIO_Data *data) {
+/*void handleHeatMode(AdafruitIO_Data *data) {
     sv.heatMode = data->toBool();
     if(sv.heatMode == 0) {
         sv.desiredTemp = sv.desiredTempLow;
@@ -251,28 +289,28 @@ void handleDesiredTemp(AdafruitIO_Data *data) {
         sv.desiredTempHigh = sv.desiredTemp;
     }
     savePreferences();
-}
+}*/
 void sendMeasuredTemp() {
     static uint32_t lastUpdateTemp = 0;
     if((millis() > (lastUpdateTemp + updateCloudPeriod)) || (lastUpdateTemp == 0)) {
         lastUpdateTemp = millis();
-        measuredTemp->save(sv.measuredTemp);
+        measuredTemp.publish(sv.measuredTemp);
     printf("measuredTemp\n");
     }
 }
 void sendDesiredTemp() {
-    desiredTemp->save(sv.desiredTemp);
+    //desiredTemp->save(sv.desiredTemp);
     printf("desiredTemp\n");
 }
 void sendHeatMode() {
-    heatMode->save(sv.heatMode);
+    //heatMode->save(sv.heatMode);
     printf("heatMode\n");
 }
 void sendHeatOn() {
     static bool prevHeatOn = true;
     if(sv.heatOn != prevHeatOn) {
         prevHeatOn = sv.heatOn;
-        heatOn->save(sv.heatOn);
+        //heatOn->save(sv.heatOn);
         printf("heatOn\n");
     }
 }
