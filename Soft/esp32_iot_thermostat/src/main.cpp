@@ -34,20 +34,28 @@ const uint16_t freq = 5000;
 const uint8_t ledChannel = 0;
 const uint8_t resolution = 10;
 
-const uint8_t photoresistorPin = 35;
 const uint8_t relayPin = 16;
 const float desiredTempMax = 25.0;       // [°C]
 const float desiredTempMin = 3.0;        // [°C]
 const float hysteresisUpTemp = 0.5;      // [°C]
 const float hysteresisDownTemp = 0.5;    // [°C]
-const uint32_t measuredTempUpdatePeriod = 10000;    // 10 s [ms]
-const uint32_t updateCloudPeriod = 300000;          // 5 min [ms]
+const uint32_t measuredTempPeriod = 10000;    // 10 s [ms]
+const uint32_t updateCloudPeriod = 300000;    // 5 min [ms]
+const uint32_t cloudConnectPeriod = 10000;    // 10 s [ms]
 
+enum WifiStatus {
+    checkWifi,
+    connectWifi,
+    checkMqtt,
+    connectMqtt,
+    disconnected,
+    connected,
+    waiting
+};
 
-struct stateVector{
+struct stateVector {
     float measuredTemp = 0.0;                  // [°C]
     float measuredHum = 0.0;                   // [%]
-    int16_t measuredIlluminance = 0;           // 12-bit reading
     float desiredTempLow = defaultLowTemp;     // [°C]
     float desiredTempHigh = defaultHighTemp;   // [°C]
     float desiredTemp = defaultLowTemp;        // [°C]
@@ -55,6 +63,7 @@ struct stateVector{
     bool heatOn = false;   // false-not heating, true-heating now
     int16_t displayBrightness = 0;   // 10-bit output
     uint8_t displayState = 0;        // 0-measuredTemp, 1-desiredTemp
+    bool cloudConnected = false;         // false-unconnected, true-connected
 } sv;
 
 DHT dht(dhtPin, DHT22);
@@ -73,43 +82,24 @@ AdafruitIO_Feed *heatOn = io.feed("heatOn");
 */
 
 Adafruit_MQTT_Publish measuredTemp = Adafruit_MQTT_Publish(&mqtt, AIO_USERNAME "/feeds/measuredTemp");
+Adafruit_MQTT_Publish desiredTemp = Adafruit_MQTT_Publish(&mqtt, AIO_USERNAME "/feeds/desiredTemp");
+Adafruit_MQTT_Publish heatOn = Adafruit_MQTT_Publish(&mqtt, AIO_USERNAME "/feeds/heatOn");
+Adafruit_MQTT_Publish heatMode = Adafruit_MQTT_Publish(&mqtt, AIO_USERNAME "/feeds/heatMode");
+
+Adafruit_MQTT_Subscribe desiredTempSub = Adafruit_MQTT_Subscribe(&mqtt, AIO_USERNAME "/feeds/desiredTemp");
+Adafruit_MQTT_Subscribe heatModeSub = Adafruit_MQTT_Subscribe(&mqtt, AIO_USERNAME "/feeds/heatMode");
 
 
 void loadPreferences();
 void savePreferences();
-//void handleHeatMode(AdafruitIO_Data *data);
-//void handleDesiredTemp(AdafruitIO_Data *data);
-void sendMeasuredTemp();
+void measureTemp();
+void sendMeasuredTemp(bool forceSend = false);
 void sendDesiredTemp();
 void sendHeatMode();
 void sendHeatOn();
-
-
-void MQTT_connect() {
-    int8_t ret;
-
-    // Stop if already connected.
-    if (mqtt.connected()) {
-        return;
-    }
-
-    Serial.print("Connecting to MQTT... ");
-
-    uint8_t retries = 3;
-    while ((ret = mqtt.connect()) != 0) { // connect will return 0 for connected
-        Serial.println(mqtt.connectErrorString(ret));
-        Serial.println("Retrying MQTT connection in 5 seconds...");
-        mqtt.disconnect();
-        delay(5000);  // wait 5 seconds
-        retries--;
-        if (retries == 0) {
-            // basically die and wait for WDT to reset me
-            while (1);
-        }
-    }
-
-    Serial.println("MQTT Connected!");
-}
+void cloudConnect(void * parameter);
+void MQTT_checkSub();
+void handleWiFiConnection();
 
 void setup() {
     digitalWrite(relayPin, false);
@@ -122,6 +112,10 @@ void setup() {
 
     lcd.init();
     dht.begin();
+    while(sv.measuredTemp < 0.01) {
+        measureTemp();
+        delay(100);
+    }
     
     ledcSetup(ledChannel, freq, resolution);
     ledcAttachPin(displayLedPin, ledChannel);
@@ -129,40 +123,17 @@ void setup() {
 
     heatRegulator.setParameters(hysteresisUpTemp, hysteresisDownTemp, desiredTempMax, desiredTempMin);
 
-    WiFi.begin(WLAN_SSID, WLAN_PASS);
-    while (WiFi.status() != WL_CONNECTED) {
-        delay(500);
-        Serial.print(".");
-    }
-    client.setCACert(adafruitio_root_ca);
-
-    //heatMode->onMessage(handleHeatMode);
-    //desiredTemp->onMessage(handleDesiredTemp);
-
     loadPreferences();
-    sendDesiredTemp();
-    sendHeatMode();
+
+    xTaskCreatePinnedToCore(cloudConnect, "cloudConnect", 10000 , NULL, 0, NULL, 1);
 }
 
 void loop() {
     // Updating sensor data
-    static uint32_t measuredTempLastUpdate = 0;
-    if((millis() > measuredTempLastUpdate + measuredTempUpdatePeriod) || (measuredTempLastUpdate == 0)) {
-        measuredTempLastUpdate = millis();
-        float t = dht.readTemperature();
-        float h = dht.readHumidity();
-        if (isnan(h) || isnan(t)) {
-            Serial.println(F("Failed to read from DHT sensor!"));
-        }
-        else {
-            sv.measuredTemp = t;
-            sv.measuredHum = h;
-        }
-    }
-    sv.measuredIlluminance = analogRead(photoresistorPin);
+    measureTemp();
 
     // Handle UI
-    MQTT_connect();
+    MQTT_checkSub();
     sendMeasuredTemp();
     sendHeatOn();
 
@@ -236,19 +207,11 @@ void loop() {
     // Automatic control
     sv.heatOn = heatRegulator.getRegAction(sv.desiredTemp, sv.measuredTemp);
 
-    int16_t brightness = displayNightLightThreshold - sv.measuredIlluminance;
-    if(brightness < 0) {
-        brightness = 0;
-    }
-    else if(brightness > displayNightLightMax) {
-        brightness = displayNightLightMax;
-    }
-    sv.displayBrightness = brightness;
-
     // Updating actuators according to current StateVector variables
     digitalWrite(relayPin, sv.heatOn);
     ledcWrite(ledChannel, sv.displayBrightness);
 
+    //printf("loop %lu\n", millis());
     delay(100);
 }
 
@@ -268,49 +231,176 @@ void savePreferences() {
     preferencesCF.putBool("heatMode", sv.heatMode);
     preferencesCF.end();
 }
-/*void handleHeatMode(AdafruitIO_Data *data) {
-    sv.heatMode = data->toBool();
-    if(sv.heatMode == 0) {
-        sv.desiredTemp = sv.desiredTempLow;
+
+void measureTemp() {
+    static uint32_t lastUpdate = 0;
+    if((millis() > (lastUpdate + measuredTempPeriod)) || (lastUpdate == 0)) {
+        lastUpdate = millis();
+
+        float temp = dht.readTemperature();
+        float hum = dht.readHumidity();
+        if (isnan(hum) || isnan(temp)) {
+            Serial.println(F("Failed to read from DHT sensor!"));
+            lastUpdate = 0; // Repeat measurement
+        }
+        else {
+            sv.measuredTemp = temp;
+            sv.measuredHum = hum;
+        }
     }
-    else if (sv.heatMode == 1) {
-        sv.desiredTemp = sv.desiredTempHigh;
+}
+void sendMeasuredTemp(bool forceSend) {
+    if (!sv.cloudConnected) {
+        return;
     }
 
-    savePreferences();
-    sendDesiredTemp();
-}
-void handleDesiredTemp(AdafruitIO_Data *data) {
-    sv.desiredTemp = data->toFloat();
-    if(sv.heatMode == 0) {
-        sv.desiredTempLow = sv.desiredTemp;
-    }
-    if(sv.heatMode == 1) {
-        sv.desiredTempHigh = sv.desiredTemp;
-    }
-    savePreferences();
-}*/
-void sendMeasuredTemp() {
-    static uint32_t lastUpdateTemp = 0;
-    if((millis() > (lastUpdateTemp + updateCloudPeriod)) || (lastUpdateTemp == 0)) {
-        lastUpdateTemp = millis();
+    static uint32_t lastUpdate = 0;
+    if((forceSend || (millis() > (lastUpdate + updateCloudPeriod)) || (lastUpdate == 0))) {
+        lastUpdate = millis();
+
         measuredTemp.publish(sv.measuredTemp);
-    printf("measuredTemp\n");
+        printf("measuredTemp\n");
     }
 }
 void sendDesiredTemp() {
-    //desiredTemp->save(sv.desiredTemp);
+    if (!sv.cloudConnected) {
+        return;
+    }
+
+    desiredTemp.publish(sv.desiredTemp);
     printf("desiredTemp\n");
 }
 void sendHeatMode() {
-    //heatMode->save(sv.heatMode);
+    if (!sv.cloudConnected) {
+        return;
+    }
+
+    heatMode.publish(sv.heatMode);
     printf("heatMode\n");
 }
 void sendHeatOn() {
+    if (!sv.cloudConnected) {
+        return;
+    }
+
     static bool prevHeatOn = true;
     if(sv.heatOn != prevHeatOn) {
         prevHeatOn = sv.heatOn;
-        //heatOn->save(sv.heatOn);
+        heatOn.publish(sv.heatOn);
         printf("heatOn\n");
+    }
+}
+void cloudConnect(void * parameter) {
+    WiFi.begin(WLAN_SSID, WLAN_PASS);
+
+    client.setCACert(adafruitio_root_ca);
+    mqtt.subscribe(&desiredTempSub);
+    mqtt.subscribe(&heatModeSub);
+    WifiStatus wifiStatus = checkWifi;
+
+    for(;;) {
+        switch(wifiStatus) {
+            case checkWifi: {
+                if(WiFi.status() == WL_CONNECTED) {
+                    wifiStatus = checkMqtt;
+                }
+                else {
+                    wifiStatus = connectWifi;
+                }
+                break;
+            }
+            case connectWifi: {
+                WiFi.reconnect();
+                uint32_t connectStart = millis();
+                while(WiFi.status() != WL_CONNECTED && (millis() < (connectStart + 3000))) {
+                    delay(200);
+                }
+                if(WiFi.status() == WL_CONNECTED) {
+                    wifiStatus = checkWifi;
+                }
+                else {
+                    wifiStatus = disconnected;
+                    printf("Failed connecting to wifi\n");
+                } 
+                break;
+            }
+            case checkMqtt: {
+                if(mqtt.connected() == true) {
+                    wifiStatus = connected;
+                }
+                else {
+                    wifiStatus = connectMqtt;
+                }
+                break;
+            }
+            case connectMqtt: {
+                mqtt.connect(); // blocking command (5s)
+                if(mqtt.connected() == true) {
+                    wifiStatus = checkWifi;
+                }
+                else {
+                    mqtt.disconnect();
+                    wifiStatus = disconnected;
+                    printf("Failed connecting to MQTT broker\n");
+                }
+                break;
+            }
+            case disconnected: {
+                WiFi.disconnect();
+                mqtt.disconnect();
+                sv.cloudConnected = false;
+                wifiStatus = waiting;
+                break;
+            }
+            case connected: {
+                if(sv.cloudConnected == false) {
+                    sv.cloudConnected = true;
+                    sendDesiredTemp();
+                    sendHeatMode();
+                    sendHeatOn();
+                }
+                wifiStatus = waiting;
+                break;
+            }
+            case waiting: {
+                delay(cloudConnectPeriod);
+                wifiStatus = checkWifi;
+                break;
+            }
+            default:
+                printf("Error in wifiState\n");
+        }
+    }
+}
+void MQTT_checkSub() {
+    if (!sv.cloudConnected) {
+        return;
+    }
+
+    Adafruit_MQTT_Subscribe *subscription;
+    subscription = mqtt.readSubscription();
+    if(subscription == &desiredTempSub) {
+        sv.desiredTemp = atof((char *)desiredTempSub.lastread);
+        if(sv.heatMode == 0) {
+            sv.desiredTempLow = sv.desiredTemp;
+        }
+        if(sv.heatMode == 1) {
+            sv.desiredTempHigh = sv.desiredTemp;
+        }
+        savePreferences();
+        sendHeatOn();
+    }
+    else if(subscription == &heatModeSub) {
+        sv.heatMode = atoi((char *)heatModeSub.lastread);
+        if(sv.heatMode == 0) {
+            sv.desiredTemp = sv.desiredTempLow;
+        }
+        else if (sv.heatMode == 1) {
+            sv.desiredTemp = sv.desiredTempHigh;
+        }
+
+        savePreferences();
+        sendDesiredTemp();
+        sendHeatOn();
     }
 }
