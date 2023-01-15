@@ -6,23 +6,24 @@
 #include "WiFiClientSecure.h"
 #include "Adafruit_MQTT.h"
 #include "Adafruit_MQTT_Client.h"
+#include "U8g2lib.h"
 
-#include <HT1621_universal.h>
 #include "OnOffRegulator.h"
 #include "config.h"
 
-const uint8_t dhtPin = 17;
-const uint8_t displayCsPin = 14;   // Chip selection output
-const uint8_t displayWrPin = 27;   // Read clock output
-const uint8_t displayDataPin = 26; // Serial data output
-const uint8_t displayLedPin = 13;
-const uint8_t buttonUpPin = 5;
-const uint8_t buttonDownPin = 18;
-const uint8_t buttonOkPin = 19;
+const uint8_t dhtPin = 16;
+const uint8_t relayPin = 34;
+const uint8_t displayCLK = 23;
+const uint8_t displayDIN = 19;
+const uint8_t displayDC = 18;
+const uint8_t displayCE = 5;
+const uint8_t displayRST = 32;
+const uint8_t displayBL = 33;
+const uint8_t buttonUpPin = 12;
+const uint8_t buttonDownPin = 14;
+const uint8_t buttonOkPin = 27;
 const uint16_t buttonPressDelay = 300;           // [ms]
 const uint16_t buttonOkDelay = 2000;             // [ms]
-const uint16_t displayNightLightThreshold = 300; // 0-4096 
-const uint16_t displayNightLightMax = 80;        // 0-1023
 const uint16_t displayReturnDelay = 3000;        // [ms]
 const float defaultLowTemp = 10.0;               // [°C]
 const float defaultHighTemp = 20.0;              // [°C]
@@ -34,7 +35,6 @@ const uint16_t freq = 5000;
 const uint8_t ledChannel = 0;
 const uint8_t resolution = 10;
 
-const uint8_t relayPin = 16;
 const float desiredTempMax = 25.0;       // [°C]
 const float desiredTempMin = 3.0;        // [°C]
 const float hysteresisUpTemp = 0.5;      // [°C]
@@ -42,6 +42,7 @@ const float hysteresisDownTemp = 0.5;    // [°C]
 const uint32_t measuredTempPeriod = 10000;    // 10 s [ms]
 const uint32_t updateCloudPeriod = 300000;    // 5 min [ms]
 const uint32_t cloudConnectPeriod = 10000;    // 10 s [ms]
+const uint16_t dispUpdatePeriod = 1000;        // [ms]
 
 enum WifiStatus {
     checkWifi,
@@ -69,7 +70,7 @@ struct stateVector {
 DHT dht(dhtPin, DHT22);
 Preferences preferencesCF;
 OnOffRegulator heatRegulator;
-HT1621_universal lcd(displayCsPin, displayWrPin, displayDataPin);
+U8G2_PCD8544_84X48_F_4W_SW_SPI display = U8G2_PCD8544_84X48_F_4W_SW_SPI(U8G2_R0, displayCLK, displayDIN, displayCE, displayDC, displayRST);
 
 WiFiClientSecure client;
 Adafruit_MQTT_Client mqtt(&client, AIO_SERVER, AIO_SERVERPORT, AIO_USERNAME, AIO_KEY);
@@ -81,13 +82,13 @@ AdafruitIO_Feed *desiredTemp = io.feed("desiredTemp");
 AdafruitIO_Feed *heatOn = io.feed("heatOn");
 */
 
-Adafruit_MQTT_Publish measuredTemp = Adafruit_MQTT_Publish(&mqtt, AIO_USERNAME "/feeds/measuredTemp");
-Adafruit_MQTT_Publish desiredTemp = Adafruit_MQTT_Publish(&mqtt, AIO_USERNAME "/feeds/desiredTemp");
-Adafruit_MQTT_Publish heatOn = Adafruit_MQTT_Publish(&mqtt, AIO_USERNAME "/feeds/heatOn");
-Adafruit_MQTT_Publish heatMode = Adafruit_MQTT_Publish(&mqtt, AIO_USERNAME "/feeds/heatMode");
+Adafruit_MQTT_Publish measuredTemp = Adafruit_MQTT_Publish(&mqtt, AIO_USERNAME "/feeds/testMeasuredTemp");
+Adafruit_MQTT_Publish desiredTemp = Adafruit_MQTT_Publish(&mqtt, AIO_USERNAME "/feeds/testDesiredTemp");
+Adafruit_MQTT_Publish heatOn = Adafruit_MQTT_Publish(&mqtt, AIO_USERNAME "/feeds/testHeatOn");
+Adafruit_MQTT_Publish heatMode = Adafruit_MQTT_Publish(&mqtt, AIO_USERNAME "/feeds/testHeatMode");
 
-Adafruit_MQTT_Subscribe desiredTempSub = Adafruit_MQTT_Subscribe(&mqtt, AIO_USERNAME "/feeds/desiredTemp");
-Adafruit_MQTT_Subscribe heatModeSub = Adafruit_MQTT_Subscribe(&mqtt, AIO_USERNAME "/feeds/heatMode");
+Adafruit_MQTT_Subscribe desiredTempSub = Adafruit_MQTT_Subscribe(&mqtt, AIO_USERNAME "/feeds/testDesiredTemp");
+Adafruit_MQTT_Subscribe heatModeSub = Adafruit_MQTT_Subscribe(&mqtt, AIO_USERNAME "/feeds/testHeatMode");
 
 
 void loadPreferences();
@@ -100,6 +101,7 @@ void sendHeatOn();
 void cloudConnect(void * parameter);
 void MQTT_checkSub();
 void handleWiFiConnection();
+void displayTemp(float temp);
 
 void setup() {
     digitalWrite(relayPin, false);
@@ -110,7 +112,8 @@ void setup() {
 
     Serial.begin(115200);
 
-    lcd.init();
+    display.begin();
+
     dht.begin();
     while(sv.measuredTemp < 0.01) {
         measureTemp();
@@ -118,8 +121,8 @@ void setup() {
     }
     
     ledcSetup(ledChannel, freq, resolution);
-    ledcAttachPin(displayLedPin, ledChannel);
-    pinMode(displayLedPin, OUTPUT);
+    ledcAttachPin(displayBL, ledChannel);
+    pinMode(displayBL, OUTPUT);
 
     heatRegulator.setParameters(hysteresisUpTemp, hysteresisDownTemp, desiredTempMax, desiredTempMin);
 
@@ -176,7 +179,7 @@ void loop() {
 
     if(sv.displayState == 0) {
         // Display measured temp
-        lcd.displayCelsius(sv.measuredTemp);
+        displayTemp(sv.measuredTemp);
 
         if(buttonUpPressed || buttonDownPressed || buttonOkPressed) {
             sv.displayState = 1;
@@ -184,7 +187,7 @@ void loop() {
     }
     else if(sv.displayState == 1) {
         // Display desired temp of the current heat mode
-        lcd.displayCelsius(sv.desiredTemp + tempChange);
+        displayTemp(sv.desiredTemp + tempChange);
 
         if(millis() > buttonLastPressed + displayReturnDelay) {
             // save selected temp
@@ -211,7 +214,7 @@ void loop() {
     digitalWrite(relayPin, sv.heatOn);
     ledcWrite(ledChannel, sv.displayBrightness);
 
-    //printf("loop %lu\n", millis());
+    printf("loop %lu\n", millis());
     delay(100);
 }
 
@@ -403,4 +406,33 @@ void MQTT_checkSub() {
         sendDesiredTemp();
         sendHeatOn();
     }
+}
+
+void displayTemp(float temp) {
+    static uint32_t prevDispUpdate = 0;
+    if(millis() > prevDispUpdate + dispUpdatePeriod) {
+        prevDispUpdate = millis();
+    }
+    else {
+        return;
+    }
+
+    display.clearBuffer();
+    char outString[16];
+
+    display.setFont(u8g2_font_inb38_mn);
+    sprintf(outString, "%2d", int(temp));
+    display.drawStr(0, 37, outString);
+
+    display.drawDisc(61, 35, 2, U8G2_DRAW_ALL);
+
+    display.setFont(u8g2_font_inb24_mn);
+    sprintf(outString, "%1d", int(temp*10 + 0.5)%10);
+    display.drawStr(64, 37, outString);
+
+    display.setFont(u8g2_font_tenthinnerguys_tf );
+    sprintf(outString, "°C");
+    display.drawUTF8(66, 10, outString);
+
+    display.sendBuffer();
 }
