@@ -42,7 +42,6 @@ const float hysteresisDownTemp = 0.5;    // [°C]
 const uint32_t measuredTempPeriod = 10000;    // 10 s [ms]
 const uint32_t updateCloudPeriod = 300000;    // 5 min [ms]
 const uint32_t cloudConnectPeriod = 10000;    // 10 s [ms]
-const uint16_t dispUpdatePeriod = 1000;        // [ms]
 
 enum WifiStatus {
     checkWifi,
@@ -101,7 +100,7 @@ void sendHeatOn();
 void cloudConnect(void * parameter);
 void MQTT_checkSub();
 void handleWiFiConnection();
-void displayTemp(float temp);
+void displayData(float temp, int heatMode, bool heatOn);
 
 void setup() {
     digitalWrite(relayPin, false);
@@ -179,7 +178,7 @@ void loop() {
 
     if(sv.displayState == 0) {
         // Display measured temp
-        displayTemp(sv.measuredTemp);
+        displayData(sv.measuredTemp, sv.heatMode, sv.heatOn);
 
         if(buttonUpPressed || buttonDownPressed || buttonOkPressed) {
             sv.displayState = 1;
@@ -187,7 +186,7 @@ void loop() {
     }
     else if(sv.displayState == 1) {
         // Display desired temp of the current heat mode
-        displayTemp(sv.desiredTemp + tempChange);
+        displayData(sv.desiredTemp + tempChange, sv.heatMode, sv.heatOn);
 
         if(millis() > buttonLastPressed + displayReturnDelay) {
             // save selected temp
@@ -214,7 +213,7 @@ void loop() {
     digitalWrite(relayPin, sv.heatOn);
     ledcWrite(ledChannel, sv.displayBrightness);
 
-    printf("loop %lu\n", millis());
+    //printf("loop %lu\n", millis());
     delay(100);
 }
 
@@ -408,23 +407,37 @@ void MQTT_checkSub() {
     }
 }
 
-void displayTemp(float temp) {
-    static uint32_t prevDispUpdate = 0;
-    if(millis() > prevDispUpdate + dispUpdatePeriod) {
-        prevDispUpdate = millis();
+void displayData(float temp, int heatMode, bool heatOn) {
+    static float prevTemp = 0.0;
+    static int prevHeatMode = 0;
+    static bool prevHeatOn = 0;
+
+    bool updateNeeded = false;
+    if(temp != prevTemp) {
+        prevTemp = temp;
+        updateNeeded = true;
     }
-    else {
+    if(heatMode != prevHeatMode) {
+        prevHeatMode = heatMode;
+        updateNeeded = true;
+    }
+    if(heatOn != prevHeatOn) {
+        prevHeatOn = heatOn;
+        updateNeeded = true;
+    }
+
+    if(updateNeeded == false ) {
         return;
     }
 
     display.clearBuffer();
-    char outString[16];
+    char outString[20];
 
     display.setFont(u8g2_font_inb38_mn);
     sprintf(outString, "%2d", int(temp));
     display.drawStr(0, 37, outString);
 
-    display.drawDisc(61, 35, 2, U8G2_DRAW_ALL);
+    display.drawDisc(61, 34, 2, U8G2_DRAW_ALL);
 
     display.setFont(u8g2_font_inb24_mn);
     sprintf(outString, "%1d", int(temp*10 + 0.5)%10);
@@ -433,6 +446,25 @@ void displayTemp(float temp) {
     display.setFont(u8g2_font_tenthinnerguys_tf );
     sprintf(outString, "°C");
     display.drawUTF8(66, 10, outString);
+
+    char modeMessage[6], heatingMessage[6];
+    if(sv.heatMode == 0) {
+        sprintf(modeMessage, "NIGHT");
+    }
+    else if(sv.heatMode == 1) {
+        sprintf(modeMessage, "DAY");
+    }
+
+    if(sv.heatOn == false) {
+        sprintf(heatingMessage, "IDLE");
+    }
+    else {
+        sprintf(heatingMessage, "HEAT");
+    }
+
+    sprintf(outString, "%s - %s", modeMessage, heatingMessage);
+
+    display.drawUTF8(0, 48, outString);
 
     display.sendBuffer();
 }
